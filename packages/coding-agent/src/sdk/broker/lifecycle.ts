@@ -4879,7 +4879,6 @@ type CloseRecord = {
 	processIncarnation?: string;
 };
 
-
 function requestedCloseAuthority(input: Input): { authority: CloseAuthority | undefined } | { error: BrokerResponse } {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;

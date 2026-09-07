@@ -5154,7 +5154,7 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 		const identity = await deriveIdempotencyIdentity(agentDir, "session.resume", key, targetHash);
 		const input = { cwd: root, stateRoot, sessionId };
 		const seededIncarnation = endpointIncarnation(
-			{ endpointGeneration: 2, endpointMtimeMs, pid: host.pid },
+			{ endpointGeneration: 2, endpointMtimeMs, endpointFileId, pid: host.pid },
 			sessionId,
 		);
 		expect(seededIncarnation).toBeString();
@@ -5234,6 +5234,7 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 				sessionId,
 				cwd: root,
 				endpointGeneration: 2,
+				endpointIncarnation: expect.stringMatching(/^[a-f0-9]{64}$/),
 				pid: host.pid,
 				endpointMtimeMs: exactMtimeMs,
 				reused: true,
