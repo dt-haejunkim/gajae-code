@@ -5502,6 +5502,9 @@ export class AuthStorage {
 				enterpriseUrl: result.newCredentials.enterpriseUrl ?? selection.credential.enterpriseUrl,
 				mcpBinding: refreshedAuthority.mcpBinding,
 			};
+			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
+			const sameUsageCredential =
+				selection.revision === usageCredentialRevision && authCredentialEquals(selection.credential, updated);
 			this.#replaceCredentialAt(
 				provider,
 				selection.index,
@@ -5512,7 +5515,7 @@ export class AuthStorage {
 
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
 				const sameAccount = usageAccountId === updated.accountId;
-				if (rejectKnownDeniedPlan || !usageChecked || !sameAccount) {
+				if ((rejectKnownDeniedPlan && !sameUsageCredential) || !usageChecked || !sameAccount) {
 					usage = await this.#getUsageReport(provider, updated, {
 						...options,
 						forceFresh: rejectKnownDeniedPlan,
