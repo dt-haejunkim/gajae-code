@@ -19,6 +19,7 @@ import {
 	redactBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
+import { endpointIncarnation } from "../src/sdk/broker/endpoint-authority";
 import {
 	brokerOwnerForTest,
 	brokerSpawnEnvironmentForTest,
@@ -49,6 +50,14 @@ import {
 } from "../src/session/session-storage";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-"));
+const nextFloat = (value: number): number => {
+	const buf = new ArrayBuffer(8);
+	const f64 = new Float64Array(buf);
+	const u64 = new BigUint64Array(buf);
+	f64[0] = value;
+	u64[0] = u64[0]! + 1n;
+	return f64[0]!;
+};
 
 it("does not disclose launch paths when cleanup remains uncertain", () => {
 	const executable = "/private/runtime/gjc-secret";
@@ -2081,14 +2090,13 @@ describe("SDK broker identity and discovery", () => {
 			endpointGeneration: 3,
 			pid: process.pid,
 		});
-		const endpointIncarnation = createHash("sha256")
-			.update(JSON.stringify({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid, sessionId: "s" }))
-			.digest("hex");
+		const boundIncarnation = endpointIncarnation({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid }, "s");
+		expect(boundIncarnation).toBeString();
 		expect(
 			await broker.handleRequest("session.get_endpoint", {
 				sessionId: "s",
 				endpointGeneration: 3,
-				endpointIncarnation,
+				endpointIncarnation: boundIncarnation,
 			}),
 		).toEqual({
 			ok: true,
@@ -2346,6 +2354,116 @@ describe("SDK broker identity and discovery", () => {
 			expect(replayed).toEqual({
 				ok: false,
 				error: { code: "endpoint_stale", message: "lifecycle replay target was replaced" },
+			});
+		} finally {
+			await broker.stop();
+			await saved?.close();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("endpoint incarnation is stable across one float ulp but binds file identity (#5376)", async () => {
+		const base = { endpointGeneration: 1, endpointMtimeMs: 1788784000000.25, pid: 1234 };
+		const skewed = nextFloat(base.endpointMtimeMs);
+		expect(skewed).not.toBe(base.endpointMtimeMs);
+		expect(Math.abs(skewed - base.endpointMtimeMs)).toBeLessThan(0.001);
+		// Same file, two stat spellings: identical digest.
+		expect(endpointIncarnation({ ...base, endpointMtimeMs: skewed }, "s")).toBe(endpointIncarnation(base, "s"));
+		// Same-millisecond successor with a distinct file identity: stale.
+		expect(endpointIncarnation({ ...base, endpointMtimeMs: skewed, endpointFileId: "64768:111" }, "s")).not.toBe(
+			endpointIncarnation({ ...base, endpointFileId: "64768:222" }, "s"),
+		);
+		// Legacy rows without a file identity still hash (back-compat).
+		expect(endpointIncarnation(base, "s")).toBeString();
+	});
+	it("replays a lifecycle success when the indexed mtime matches the live file (#5376)", async () => {
+		const dir = await temp();
+		const cwd = path.join(dir, "repo");
+		const stateRoot = path.join(cwd, ".gjc", "state");
+		const broker = new Broker({ agentDir: dir });
+		let saved: SessionManager | undefined;
+		try {
+			await fs.mkdir(cwd, { recursive: true });
+			saved = SessionManager.create(cwd, SessionManager.managedDestination(cwd, dir));
+			await saved.ensureOnDisk();
+			const sessionId = saved.getSessionId();
+			const sessionPath = saved.getSessionFile();
+			if (!sessionPath) throw new Error("Expected a saved session path.");
+			const captured = SessionManager.captureTranscriptStrict(sessionPath);
+			if (captured.kind !== "captured") throw new Error("Expected a captured saved session.");
+			const identity = captured.snapshot.identity;
+			const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "original-token" }),
+			);
+			await broker.start();
+			const liveStat = await fs.stat(endpointPath, { bigint: true });
+			const liveMtimeMs = Number(liveStat.mtimeNs) / 1_000_000;
+			const locator = { cwd, worktreeRoot: null, stateRoot };
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: liveMtimeMs,
+				endpointFileId: `${liveStat.dev}:${liveStat.ino}`,
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+			const input = {
+				cwd,
+				stateRoot,
+				sessionId,
+				sessionPath,
+				sessionIdentity: {
+					dev: identity.dev.toString(),
+					ino: identity.ino.toString(),
+					size: identity.size,
+					mtimeMs: identity.mtimeMs,
+					mtimeNs: identity.mtimeNs.toString(),
+					sha256: identity.sha256,
+				},
+			};
+			const first = await broker.handleRequest("session.resume", input, "fileid-replay");
+			expect(first).toMatchObject({
+				ok: true,
+				result: { endpointGeneration: 1, endpoint: { token: "original-token" } },
+			});
+			// Same file re-registered through the libuv-double spelling must replay.
+			const floatStat = await fs.stat(endpointPath);
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: floatStat.mtimeMs,
+				endpointFileId: `${liveStat.dev}:${liveStat.ino}`,
+			});
+			expect(await broker.handleRequest("session.resume", input, "fileid-replay")).toMatchObject({ ok: true });
+			// A genuine successor with a distinct file identity but the same
+			// pid/generation and a colliding rounded mtime is descriptor-stale.
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 1,
+				pid: process.pid,
+				endpointMtimeMs: floatStat.mtimeMs,
+				endpointFileId: "64768:999999999",
+			});
+			// The successor row no longer matches the live descriptor, so the
+			// descriptor-bound read rejects it before replay comparison.
+			expect(await broker.handleRequest("session.resume", input, "fileid-replay")).toEqual({
+				ok: false,
+				error: { code: "endpoint_stale", message: "session endpoint is stale" },
 			});
 		} finally {
 			await broker.stop();
