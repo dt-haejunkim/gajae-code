@@ -551,8 +551,12 @@ export interface AuthCredentialStore {
 	 *
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
-	fetchUsageReports?(signal?: AbortSignal): Promise<UsageReport[] | null>;
-	fetchUsageReportsForProvider?(provider: Provider, signal?: AbortSignal): Promise<UsageReport[] | null>;
+	fetchUsageReports?(signal?: AbortSignal, options?: { forceFresh?: boolean }): Promise<UsageReport[] | null>;
+	fetchUsageReportsForProvider?(
+		provider: Provider,
+		signal?: AbortSignal,
+		options?: { forceFresh?: boolean },
+	): Promise<UsageReport[] | null>;
 	/** Synchronous, zero-network usage presentation peek. */
 	peekCachedUsagePresentation?(provider: Provider, credentialId: number): CachedUsagePresentation | undefined;
 	/** Record a safe usage observation after an explicit fetch/check. */
@@ -733,8 +737,12 @@ export type AuthStorageOptions = {
 	 * Implementations may return null when no usage data is available; the
 	 * AuthStorage caller surfaces that to its own consumer unchanged.
 	 */
-	fetchUsageReports?: (signal?: AbortSignal) => Promise<UsageReport[] | null>;
-	fetchUsageReportsForProvider?: (provider: Provider, signal?: AbortSignal) => Promise<UsageReport[] | null>;
+	fetchUsageReports?: (signal?: AbortSignal, options?: { forceFresh?: boolean }) => Promise<UsageReport[] | null>;
+	fetchUsageReportsForProvider?: (
+		provider: Provider,
+		signal?: AbortSignal,
+		options?: { forceFresh?: boolean },
+	) => Promise<UsageReport[] | null>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4160,6 +4168,8 @@ export class AuthStorage {
 		signal?: AbortSignal;
 		/** Disable provider/account/error logging for secret-safe control surfaces. */
 		logDetails?: boolean;
+		/** Bypass cached reports and existing in-flight requests for admission checks. */
+		forceFresh?: boolean;
 	}): Promise<UsageReport[] | null> {
 		// Caller override > store-level hook > local per-credential fan-out.
 		// `RemoteAuthCredentialStore` implements the store hook so a gateway
@@ -4169,7 +4179,7 @@ export class AuthStorage {
 			? (this.#fetchUsageReportsForProviderOverride ?? this.#store.fetchUsageReportsForProvider?.bind(this.#store))
 			: undefined;
 		if (scopedStoreFetch && options?.provider) {
-			return raceUsageWithSignal(scopedStoreFetch(options.provider), options.signal);
+			return raceUsageWithSignal(scopedStoreFetch(options.provider, undefined, options), options.signal);
 		}
 		if (options?.provider && (this.#fetchUsageReportsOverride || this.#store.fetchUsageReports)) {
 			throw new Error("Provider-scoped usage fetch is unavailable");
@@ -4182,10 +4192,10 @@ export class AuthStorage {
 			// shared upstream fetch runs to completion so peers aren't punished.
 			const OVERRIDE_KEY = "__override__";
 			let shared = this.#usageReportsInFlight.get(OVERRIDE_KEY);
-			if (!shared) {
+			if (!shared || options?.forceFresh) {
 				// Don't forward the caller signal into the shared fetch — first caller's
 				// abort would otherwise cancel the upstream for every peer.
-				shared = override().finally(() => {
+				shared = override(undefined, options).finally(() => {
 					if (this.#usageReportsInFlight.get(OVERRIDE_KEY) === shared) {
 						this.#usageReportsInFlight.delete(OVERRIDE_KEY);
 					}
@@ -4213,7 +4223,7 @@ export class AuthStorage {
 		const cacheKey = this.#buildUsageReportsCacheKey(requests);
 
 		const inFlight = this.#usageReportsInFlight.get(cacheKey);
-		if (inFlight) return raceUsageWithSignal(inFlight, options?.signal);
+		if (inFlight && !options?.forceFresh) return raceUsageWithSignal(inFlight, options?.signal);
 
 		const promise = (async () => {
 			if (options?.logDetails !== false) {
@@ -4230,7 +4240,12 @@ export class AuthStorage {
 
 			const results = await Promise.all(
 				requests.map(request =>
-					this.#fetchUsageCached(request, this.#usageRequestTimeoutMs, options?.logDetails !== false),
+					(options?.forceFresh ? this.#fetchUsageUncached : this.#fetchUsageCached).call(
+						this,
+						request,
+						this.#usageRequestTimeoutMs,
+						options?.logDetails !== false,
+					),
 				),
 			);
 			const reports = results.filter((report): report is UsageReport => report !== null);
