@@ -15063,10 +15063,13 @@ export class AgentSession {
 		compactionEntryId: string,
 		firstKeptEntryId: string,
 		fromExtension?: boolean,
+		identityIsCurrent?: () => boolean,
 	): Promise<CompactionEntry | undefined> {
 		const eviction = this.sessionManager.evictCompactedContent(firstKeptEntryId, compactionEntryId);
 		if (eviction.evictedEntries > 0) await this.sessionManager.rewriteEntries();
+		if (identityIsCurrent?.() === false) return undefined;
 		const sessionContext = this.buildDisplaySessionContext();
+		if (identityIsCurrent?.() === false) return undefined;
 		this.agent.replaceMessages(sessionContext.messages, {
 			historyRewrite: { reason: "compaction", preserveSeededPrefix: true },
 		});
@@ -15082,6 +15085,7 @@ export class AgentSession {
 			| undefined;
 
 		if (this.#extensionRunner && savedCompactionEntry) {
+			if (identityIsCurrent?.() === false) return undefined;
 			await this.#extensionRunner.emit({
 				type: "session_compact",
 				compactionEntry: savedCompactionEntry,
@@ -16249,6 +16253,7 @@ export class AgentSession {
 			const sessionId = this.sessionId;
 			this.#disconnectFromAgent();
 			await this.abort();
+			await Promise.allSettled([...this.#autoCompactionCompletions]);
 			this.#cancelOwnAsyncJobs();
 			this.#suppressOwnAsyncJobDeliveries();
 			this.yieldQueue.clear();
@@ -20937,7 +20942,12 @@ export class AgentSession {
 				preserveData,
 			);
 			this.#recordAdaptiveCompactionReset(tokensBefore);
-			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+			await this.#applyCompactionPostAppend(
+				compactionEntryId,
+				firstKeptEntryId,
+				fromExtension,
+				compactionIdentityIsCurrent,
+			);
 			if (autoCompactionSignal.aborted || !compactionIdentityIsCurrent()) return await emitAborted();
 
 			const result: CompactionResult = {
