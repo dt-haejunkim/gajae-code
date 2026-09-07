@@ -34,14 +34,16 @@ import {
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 } from "./discovery";
-import { matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
+import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
 	executeLifecycle,
 	isCanonicalSessionId,
 	prepareSpawnChildHostLaunch,
+	readSessionLifecycleFailure,
 	validateBrokerModelPresetSync,
+	writeEffectMarker,
 } from "./lifecycle";
 import {
 	type LifecycleDurableEffectsReceipt,
@@ -724,36 +726,12 @@ function credentialFreeLifecycleResponse(value: unknown): unknown {
 type LifecycleReplayEndpoint = {
 	endpoint: Record<string, unknown>;
 	endpointGeneration: number;
+	endpointIncarnation: string;
 	pid: number;
 	endpointMtimeMs: number;
 };
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
-function endpointIncarnation(
-	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
-	sessionId: string,
-): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			canonicalJson({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
 function expectedEndpointAuthority(input: Record<string, unknown>): EndpointAuthority | BrokerResponse {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;
@@ -1588,12 +1566,34 @@ export class Broker {
 					).claim;
 					return spawnFailureError(failure);
 				}
+				const { pid, processIncarnation: incarnation } = launched.proof;
+				if (pid === undefined || incarnation === undefined) {
+					const failure: SpawnSubstrateFailure = {
+						substrateKind: launched.proof.substrateKind,
+						code: "substrate_proof_failed",
+						message: "session.spawn substrate lacks lifecycle process authority",
+					};
+					await this.#releaseUnownedSubstrate(provider, launchedProof);
+					launchedProof = undefined;
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "pre_send_rejected",
+							failure,
+						})
+					).claim;
+					return spawnFailureError(failure);
+				}
+				const marker = { pid, incarnation, effectMarker: prep.effectMarker };
+				await writeEffectMarker(prep.stateRoot, prep.childId, marker);
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,
 					cwd: prep.cwd,
 					stateRoot: prep.stateRoot,
 				});
 				if (!registration.ok) {
+					const startupFailure = await readSessionLifecycleFailure(prep.stateRoot, prep.childId, marker);
 					await this.#releaseUnownedSubstrate(provider, launchedProof);
 					launchedProof = undefined;
 					current = (
@@ -1603,7 +1603,11 @@ export class Broker {
 							to: "uncertain",
 						})
 					).claim;
-					return error("terminal_uncertain", "session.spawn child registration is uncertain");
+					return error(
+						"terminal_uncertain",
+						"session.spawn child registration is uncertain" +
+							(startupFailure ? ` (${startupFailure.phase}/${startupFailure.reason})` : ""),
+					);
 				}
 				pinnedRegistration = registration.registration;
 				const now = Date.now();
@@ -2404,26 +2408,35 @@ export class Broker {
 		)
 			return;
 
-		// Snapshot validation and the deterministic instance suffix protect successor locks.
-		const tombstone = path.join(
-			path.dirname(this.#lock),
-			`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}`,
-		);
-		try {
-			await fs.rename(this.#lock, tombstone);
-		} catch (e) {
-			const code = (e as NodeJS.ErrnoException).code;
-			if (["ENOENT", "EEXIST", "ENOTEMPTY", "EISDIR", "ENOTDIR"].includes(code ?? "")) return;
-			if (code === "EPERM") {
-				try {
-					await fs.lstat(tombstone);
-					return;
-				} catch (statError) {
-					if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+		// Give every reclaimed generation a fresh quarantine name. Older brokers
+		// used only the lock inode hash; if that tombstone survived a crash, the
+		// deterministic name collided forever and left the dead canonical lock in
+		// place. The random suffix preserves no-replace rename semantics without
+		// letting retained cleanup debris block takeover.
+		for (let attempt = 0; attempt < 8; attempt++) {
+			const tombstone = path.join(
+				path.dirname(this.#lock),
+				`.broker.lock.stale-${createHash("sha256").update(snapshot.lockIdentity).digest("hex")}-${randomBytes(8).toString("hex")}`,
+			);
+			try {
+				await fs.rename(this.#lock, tombstone);
+				return;
+			} catch (e) {
+				const code = (e as NodeJS.ErrnoException).code;
+				if (code === "EEXIST" || code === "ENOTEMPTY") continue;
+				if (["ENOENT", "EISDIR", "ENOTDIR"].includes(code ?? "")) return;
+				if (code === "EPERM") {
+					try {
+						await fs.lstat(tombstone);
+						continue;
+					} catch (statError) {
+						if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
+					}
 				}
+				throw e;
 			}
-			throw e;
 		}
+		throw new Error(`Broker lock quarantine namespace is saturated for ${this.#lock}`);
 	}
 	async #releaseOwnedLock(): Promise<void> {
 		try {
@@ -2549,6 +2562,11 @@ export class Broker {
 				startedAt: now,
 				heartbeatAt: now,
 			};
+			// Readiness must not be externally visible until the initial session
+			// checkpoint settles. The bootstrap watchdog owns this pre-publication
+			// interval; publishing first allowed it to kill an endpoint already handed
+			// to callers when a legitimate index-lock wait outlived the fence.
+			await this.#checkpointSessionHeartbeats();
 			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
 			this.#publicationState = "healthy-owned";
 			this.#publishedAt = process.hrtime.bigint();
@@ -2560,7 +2578,6 @@ export class Broker {
 				void this.#watchPublication();
 				void this.#reapSpawnOrphans();
 			}, cadenceMs);
-			await this.#checkpointSessionHeartbeats();
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
@@ -2862,6 +2879,8 @@ export class Broker {
 			endpointMtimeMs <= 0
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const currentIncarnation = endpointIncarnation(record, sessionId);
+		if (!currentIncarnation) return error("endpoint_stale", "session endpoint incarnation is unavailable");
 		const endpoint = await this.#readEndpoint(record, {});
 		if (!endpoint.ok) return endpoint;
 		if (endpoint.result === null || typeof endpoint.result !== "object" || Array.isArray(endpoint.result))
@@ -2869,6 +2888,7 @@ export class Broker {
 		return {
 			endpoint: endpoint.result as Record<string, unknown>,
 			endpointGeneration: record.endpointGeneration,
+			endpointIncarnation: currentIncarnation,
 			pid: record.pid,
 			endpointMtimeMs,
 		};
@@ -3041,16 +3061,21 @@ export class Broker {
 			if (this.#chains.get(target) === chain) this.#chains.delete(target);
 		}
 	}
-	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string | BrokerResponse {
+	#storeSessionListCursor(cursor: SessionListCursor, replacingToken?: string): string {
 		const now = Date.now();
 		for (const [token, stored] of this.#sessionListCursors) {
 			if (stored.expiresAt <= now) this.#sessionListCursors.delete(token);
 		}
-		const replacing = replacingToken !== undefined && this.#sessionListCursors.has(replacingToken);
-		if (!replacing && this.#sessionListCursors.size >= SESSION_LIST_MAX_CURSORS)
-			return error("invalid_input", "session.list cursor capacity is exhausted");
-		const token = randomBytes(24).toString("base64url");
 		if (replacingToken !== undefined) this.#sessionListCursors.delete(replacingToken);
+		// Pagination cursors are a paging convenience, not durable state (#5370).
+		// Evict the oldest cursor when the budget is full so abandoned or partial
+		// paginations degrade gracefully instead of failing unrelated session ops.
+		while (this.#sessionListCursors.size >= SESSION_LIST_MAX_CURSORS) {
+			const oldest = this.#sessionListCursors.keys().next();
+			if (oldest.done) break;
+			this.#sessionListCursors.delete(oldest.value);
+		}
+		const token = randomBytes(24).toString("base64url");
 		this.#sessionListCursors.set(token, cursor);
 		return token;
 	}
@@ -3110,7 +3135,8 @@ export class Broker {
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
 			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
-			return publicSession;
+			const incarnation = endpointIncarnation(session, session.sessionId);
+			return incarnation === undefined ? publicSession : { ...publicSession, endpointIncarnation: incarnation };
 		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);
@@ -3121,7 +3147,6 @@ export class Broker {
 						{ ...snapshot, offset, expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS },
 						typeof cursor === "string" ? cursor : undefined,
 					);
-		if (isBrokerResponse(continuationCursor)) return continuationCursor;
 		return {
 			ok: true,
 			result: {
@@ -3326,15 +3351,32 @@ export class Broker {
 						(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
 						typeof (replay.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 					) {
-						const refreshed = await this.#readLifecycleReplayEndpoint(
-							(replay.result as { sessionId: string }).sessionId,
-						);
+						const replayResult = objectRecord(replay.result);
+						const replaySessionId = (replay.result as { sessionId: string }).sessionId;
+						const replayIncarnation =
+							typeof replayResult?.endpointIncarnation === "string" &&
+							/^[a-f0-9]{64}$/.test(replayResult.endpointIncarnation)
+								? replayResult.endpointIncarnation
+								: endpointIncarnation(
+										{
+											endpointGeneration: replayResult?.endpointGeneration as number,
+											endpointMtimeMs: replayResult?.endpointMtimeMs as number,
+											pid: replayResult?.pid as number,
+										},
+										replaySessionId,
+									);
+						if (!replayIncarnation)
+							return error("endpoint_stale", "lifecycle replay lacks original endpoint authority");
+						const refreshed = await this.#readLifecycleReplayEndpoint(replaySessionId);
 						if (isBrokerResponse(refreshed)) return refreshed;
+						if (refreshed.endpointIncarnation !== replayIncarnation)
+							return error("endpoint_stale", "lifecycle replay target was replaced");
 						return {
 							ok: true,
 							result: {
 								...(replay.result as Record<string, unknown>),
 								endpointGeneration: refreshed.endpointGeneration,
+								endpointIncarnation: refreshed.endpointIncarnation,
 								pid: refreshed.pid,
 								endpointMtimeMs: refreshed.endpointMtimeMs,
 								endpoint: refreshed.endpoint,
@@ -3347,6 +3389,12 @@ export class Broker {
 				const response = outcome.response;
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
+					...(operation === "session.delete" &&
+					typeof input.sessionId === "string" &&
+					lifecycleResponseState(response) === "terminal_uncertain" &&
+					!pendingCleanupSessionId(response)
+						? { intendedSessionId: input.sessionId }
+						: {}),
 					response: storedResponse,
 					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
@@ -3366,6 +3414,12 @@ export class Broker {
 				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
+					...(operation === "session.delete" &&
+					typeof input.sessionId === "string" &&
+					lifecycleResponseState(response) === "terminal_uncertain" &&
+					!pendingCleanupSessionId(response)
+						? { intendedSessionId: input.sessionId }
+						: {}),
 					response: storedResponse,
 					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
@@ -3377,8 +3431,21 @@ export class Broker {
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
 			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
+			// Record the refusal's own target session so the fence it may leave
+			// is scoped to that session. Without this, a session.delete refusal
+			// for X persists as an unbound terminal_uncertain row and fences
+			// every later delete for unrelated sessions (#5364). A refusal that
+			// truly cannot name its target fences nothing (see
+			// hasUncertainCleanupForSession).
+			const refusalSessionId =
+				operation === "session.delete" && typeof input.sessionId === "string" ? input.sessionId : undefined;
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
+				...(refusalSessionId !== undefined &&
+				lifecycleResponseState(response) === "terminal_uncertain" &&
+				!pendingCleanupSessionId(response)
+					? { intendedSessionId: refusalSessionId }
+					: {}),
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 						? (response.result as { sessionId: string }).sessionId

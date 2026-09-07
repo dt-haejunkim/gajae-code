@@ -15,6 +15,7 @@ import {
 	renameNoReplacePathAsync,
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
@@ -30,6 +31,23 @@ export interface FileLockOptions {
 	previousOwnerHostIds?: readonly string[];
 }
 
+export class FileLockAcquireError extends Error {
+	readonly code = "acquire_timeout";
+
+	constructor(
+		readonly filePath: string,
+		readonly lockPath: string,
+		readonly attempts: number,
+		readonly holder: string,
+	) {
+		super(
+			`Failed to acquire lock for ${filePath} after ${attempts} attempts: ${holder} (${lockPath}); ` +
+				`a live owner is never displaced — if this is an SDK broker (gjc sdk status), it must finish or be stopped before retrying`,
+		);
+		this.name = "FileLockAcquireError";
+	}
+}
+
 const DEFAULT_OPTIONS: Required<
 	Omit<FileLockOptions, "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired">
 > = {
@@ -38,9 +56,9 @@ const DEFAULT_OPTIONS: Required<
 	retryDelayMs: 100,
 };
 
-/** Release retries cover transient Windows/Dropbox handle denial without extending the lock indefinitely. */
-export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 5;
-export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 10;
+/** Release retries cover transient handle denial and a competing exact-removal quarantine cleanup. */
+export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 20;
+export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 25;
 const PROCESS_START_TIME_FORMAT = "utc-v1";
 
 type LocalLockState = {
@@ -101,10 +119,25 @@ export function processStartTime(pid: number): string | null {
 }
 
 let ownProcessStartTime: string | undefined;
+let ownProcessIncarnation: string | null | undefined;
 
 function currentProcessStartTime(): string {
 	if (ownProcessStartTime === undefined) ownProcessStartTime = processStartTime(process.pid) ?? "unknown";
 	return ownProcessStartTime;
+}
+
+function processIncarnation(pid: number): string | null {
+	try {
+		const incarnation = nativeProcessBindings().Process.fromPid(pid)?.incarnation;
+		return typeof incarnation === "string" && incarnation.length > 0 ? incarnation : null;
+	} catch {
+		return null;
+	}
+}
+
+function currentProcessIncarnation(): string | null {
+	if (ownProcessIncarnation === undefined) ownProcessIncarnation = processIncarnation(process.pid);
+	return ownProcessIncarnation;
 }
 
 function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, string | null>): string | null {
@@ -119,6 +152,10 @@ function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, s
 
 function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
 	if (ownerLiveness(owner.pid) !== "alive") return false;
+	if (owner.process_incarnation) {
+		const currentIncarnation = processIncarnation(owner.pid);
+		return currentIncarnation === null || currentIncarnation === owner.process_incarnation;
+	}
 	if (!owner.start_time || owner.start_time === "unknown") return true;
 	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
 	if (currentStartTime === null || currentStartTime === owner.start_time) return true;
@@ -130,10 +167,12 @@ function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, st
 }
 
 function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo {
+	const incarnation = currentProcessIncarnation();
 	return {
 		pid: process.pid,
 		start_time: currentProcessStartTime(),
 		start_time_format: PROCESS_START_TIME_FORMAT,
+		...(incarnation === null ? {} : { process_incarnation: incarnation }),
 		timestamp: Date.now(),
 		owner_token: ownerToken,
 		...(ownerHostId === undefined ? {} : { owner_host_id: ownerHostId }),
@@ -327,7 +366,8 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	}
 
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token } = parsed as Partial<LockInfo>;
+	const { pid, start_time, start_time_format, process_incarnation, timestamp, owner_host_id, owner_token } =
+		parsed as Partial<LockInfo>;
 	if (
 		typeof pid !== "number" ||
 		!Number.isInteger(pid) ||
@@ -336,11 +376,12 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 		!Number.isFinite(timestamp) ||
 		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
 		(start_time_format !== undefined && (typeof start_time_format !== "string" || !start_time_format)) ||
+		(process_incarnation !== undefined && (typeof process_incarnation !== "string" || !process_incarnation)) ||
 		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id)) ||
 		(owner_token !== undefined && (typeof owner_token !== "string" || !owner_token))
 	)
 		return null;
-	return { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token };
+	return { pid, start_time, start_time_format, process_incarnation, timestamp, owner_host_id, owner_token };
 }
 
 function parseLockInfoBytes(bytes: string): LockInfo | null {
@@ -351,7 +392,8 @@ function parseLockInfoBytes(bytes: string): LockInfo | null {
 		return null;
 	}
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token } = parsed as Partial<LockInfo>;
+	const { pid, start_time, start_time_format, process_incarnation, timestamp, owner_host_id, owner_token } =
+		parsed as Partial<LockInfo>;
 	if (
 		typeof pid !== "number" ||
 		!Number.isInteger(pid) ||
@@ -360,11 +402,12 @@ function parseLockInfoBytes(bytes: string): LockInfo | null {
 		!Number.isFinite(timestamp) ||
 		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
 		(start_time_format !== undefined && (typeof start_time_format !== "string" || !start_time_format)) ||
+		(process_incarnation !== undefined && (typeof process_incarnation !== "string" || !process_incarnation)) ||
 		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id)) ||
 		(owner_token !== undefined && (typeof owner_token !== "string" || !owner_token))
 	)
 		return null;
-	return { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token };
+	return { pid, start_time, start_time_format, process_incarnation, timestamp, owner_host_id, owner_token };
 }
 
 /** @internal */
@@ -393,6 +436,8 @@ export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOw
 /** Owner identity stamped into a `<file>.lock/info` record. */
 export interface FileLockOwnerToken {
 	pid: number;
+	/** Kernel-derived identity for the exact process generation owning `pid`. */
+	process_incarnation?: string;
 	start_time?: string;
 	/** Encoding marker for the canonical UTC process-start identity. */
 	start_time_format?: string;
@@ -672,6 +717,11 @@ async function localLockKey(lockPath: string): Promise<string> {
 }
 
 function ownerIncarnationChanged(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
+	if (owner.process_incarnation) {
+		if (ownerLiveness(owner.pid) !== "alive") return false;
+		const currentIncarnation = processIncarnation(owner.pid);
+		return currentIncarnation !== null && currentIncarnation !== owner.process_incarnation;
+	}
 	if (owner.start_time_format !== PROCESS_START_TIME_FORMAT || !owner.start_time || owner.start_time === "unknown")
 		return false;
 	if (ownerLiveness(owner.pid) !== "alive") return false;
@@ -753,6 +803,7 @@ export async function removeFileLockDirForGc(
 	if (!expectedIdentity) return "owner_changed";
 	if (
 		current.pid !== expected.pid ||
+		(expected.process_incarnation !== undefined && current.process_incarnation !== expected.process_incarnation) ||
 		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
 		current.owner_host_id !== expected.owner_host_id ||
 		(expected.owner_token !== undefined && current.owner_token !== expected.owner_token) ||
@@ -931,7 +982,15 @@ async function staleLockSnapshot(
 
 async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
 	if (!snapshot.stale) return false;
-	return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
+	try {
+		return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
+	} catch {
+		// Exact removal refusal is not authority to fail or mutate by another path.
+		// Keep contending: a concurrent reclaimer may already be completing the same
+		// dead generation, while a persistent refusal remains fail-closed until the
+		// normal retry budget reports the still-held lock.
+		return false;
+	}
 }
 
 /**
@@ -1332,7 +1391,7 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 	}
 }
 
-async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
+export async function acquireFileLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	const requestedFilePath: unknown = filePath;
 	if (typeof requestedFilePath !== "string" || requestedFilePath.length === 0 || !path.isAbsolute(requestedFilePath))
 		throw new TypeError("filePath must be a non-empty absolute path");
@@ -1344,6 +1403,11 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 	const lockPath = getLockPath(filePath);
 	await ensureLockParent(path.dirname(lockPath));
+	try {
+		await reapOrphanedLockStagingDirs(lockPath);
+	} catch (error) {
+		logger.debug("Failed to reap orphaned file-lock staging directories", { lockPath, error: String(error) });
+	}
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
@@ -1392,10 +1456,7 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 			opts.signal.removeEventListener("abort", onAbort);
 		}
 	}
-	throw new Error(
-		`Failed to acquire lock for ${filePath} after ${opts.retries} attempts: ${await lockHolderDescription(lockPath)} (${lockPath}); ` +
-			`a live owner is never displaced — if this is an SDK broker (gjc sdk status), it must finish or be stopped before retrying`,
-	);
+	throw new FileLockAcquireError(filePath, lockPath, opts.retries, await lockHolderDescription(lockPath));
 }
 
 /**
@@ -1409,7 +1470,7 @@ export async function withFileLock<T>(
 	fn: () => Promise<T>,
 	options: FileLockOptions = {},
 ): Promise<T> {
-	const release = await acquireLock(filePath, options);
+	const release = await acquireFileLock(filePath, options);
 	let result: T;
 	try {
 		result = await fn();
@@ -1423,4 +1484,127 @@ export async function withFileLock<T>(
 	}
 	await release();
 	return result;
+}
+
+/** Strictly recognize the staging names emitted by tryAcquireLock. */
+export function fileLockStagingOwnerPid(name: string): number | null {
+	const match = /^.+\.lock\.pending\.([1-9]\d*)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.exec(
+		name,
+	);
+	if (!match) return null;
+	const pid = Number(match[1]);
+	return Number.isSafeInteger(pid) ? pid : null;
+}
+
+export interface FileLockStagingResult {
+	path: string;
+	pid?: number;
+	status: OwnerLiveness;
+	removed: boolean;
+	reason: string;
+}
+
+/** Observe identity before probing; neither a replacement nor a symlink inherits the verdict. */
+export async function inspectFileLockStagingDir(
+	stagingPath: string,
+	probe: (pid: number) => OwnerLiveness = ownerLiveness,
+	remove = false,
+): Promise<FileLockStagingResult> {
+	const kept: FileLockStagingResult = {
+		path: stagingPath,
+		status: "unknown",
+		removed: false,
+		reason: "unverified_staging_directory",
+	};
+	const namePid = fileLockStagingOwnerPid(path.basename(stagingPath));
+	if (namePid === null) return kept;
+	const canonical = await canonicalLockPathPreservingFinal(stagingPath);
+	const root = await fs.lstat(canonical, { bigint: true });
+	if (!root.isDirectory() || root.isSymbolicLink()) return kept;
+	const captured = nativeFileLockBindings().snapshotDirectoryTree(canonical);
+	if (
+		!captured.ok ||
+		!captured.snapshot ||
+		captured.snapshot.rootDev !== root.dev.toString() ||
+		captured.snapshot.rootIno !== root.ino.toString()
+	)
+		return kept;
+	const observation = await readFileLockObservationForGc(canonical);
+	let pid: number;
+	if (observation) {
+		if (
+			observation.identity.rootDev !== captured.snapshot.rootDev ||
+			observation.identity.rootIno !== captured.snapshot.rootIno
+		)
+			return kept;
+		pid = observation.info.pid;
+		if (observation.info.owner_host_id !== undefined) return { ...kept, pid, reason: "host_qualified_staging_owner" };
+	} else {
+		// Missing info is the only case where the filename is ownership evidence.
+		try {
+			await fs.lstat(path.join(canonical, "info"));
+			return kept;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		if (captured.snapshot.entries.some(entry => entry.relativePath !== "")) return kept;
+		pid = namePid;
+	}
+	if (pid === process.pid || namePid === process.pid) {
+		return { ...kept, pid, status: "alive", reason: "in_process_staging_owner" };
+	}
+	let status = probe(pid);
+	if (status === "alive" && observation && ownerIncarnationChanged(observation.info)) status = "dead";
+	const result: FileLockStagingResult = {
+		path: stagingPath,
+		pid,
+		status,
+		removed: false,
+		reason: `file_lock_staging_owner_${status}`,
+	};
+	if (status !== "dead" || !remove) return result;
+	if (observation) {
+		const removal = await removeFileLockDirForGc(canonical, observation.info, observation.identity);
+		return { ...result, removed: removal === "removed", reason: removal };
+	}
+	const removal = nativeFileLockBindings().exactRemoveDirectoryTree(canonical, captured.snapshot);
+	if (
+		removal.detachedPath &&
+		path.resolve(removal.detachedPath) !== path.resolve(canonical) &&
+		!removal.retainedSuccessorPath &&
+		!removal.retainedPlaceholderPath &&
+		!removal.retainedUnknownPath
+	) {
+		const detached = await fs.lstat(removal.detachedPath, { bigint: true });
+		if (
+			detached.isDirectory() &&
+			!detached.isSymbolicLink() &&
+			detached.dev.toString() === captured.snapshot.rootDev &&
+			detached.ino.toString() === captured.snapshot.rootIno
+		) {
+			await fs.rmdir(removal.detachedPath);
+			return { ...result, removed: true, reason: "removed" };
+		}
+	}
+	return { ...result, removed: removal.ok, reason: removal.ok ? "removed" : (removal.code ?? "cleanup_failed") };
+}
+
+/** Bounded opportunistic cleanup; the acquisition caller treats failures as diagnostic only. */
+export async function reapOrphanedLockStagingDirs(lockPath: string): Promise<{
+	removed: string[];
+	retained: FileLockStagingResult[];
+}> {
+	const summary: { removed: string[]; retained: FileLockStagingResult[] } = { removed: [], retained: [] };
+	const parent = path.dirname(lockPath);
+	const prefix = `${path.basename(lockPath)}.pending.`;
+	const entries = await fs.readdir(parent);
+	let candidates = 0;
+	for (const entry of entries) {
+		if (!entry.startsWith(prefix) || fileLockStagingOwnerPid(entry) === null) continue;
+		if (++candidates > 64) break;
+		const result = await inspectFileLockStagingDir(path.join(parent, entry), ownerLiveness, true);
+		if (result.removed) summary.removed.push(result.path);
+		else summary.retained.push(result);
+	}
+	return summary;
 }

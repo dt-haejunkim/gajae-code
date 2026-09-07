@@ -534,7 +534,30 @@ if (!attachment) throw new Error("session attachment unavailable");
 await attachment.send({ type: "reply", id: actionId, answer });
 ```
 
-Telegram, Discord, Slack, and third-party adapters own only their provider transport and presentation state. `SessionRouter` performs exact endpoint resolution, credential custody, replay, reconnect, rotation, and dispatch-time stale-lease rejection.
+`SessionRouter` performs exact endpoint resolution, credential custody, replay, reconnect, rotation, and dispatch-time stale-lease rejection.
+
+### Exact fenced session close
+
+Capture the endpoint authority from the original Router binding and pass that
+same pair to the lifecycle service. The generation and incarnation are one
+authority: a partial target is rejected before it reaches the Broker.
+
+```ts
+const authority = await sessionRouter.bindingAuthority(sessionId);
+if (!authority) throw new Error("session endpoint authority unavailable");
+
+const outcome = await lifecycleService.close({
+  actor,
+  capability: "session.close",
+  requestKey: "close-captured-session",
+  target: authority,
+});
+```
+
+`bindingAuthority()` returns `undefined` when the Router cannot prove the
+current endpoint and its incarnation. Do not reconstruct the authority from
+endpoint credentials, process metadata, or a later session lookup; a
+replacement may become current between capture and close.
 
 ### Exact generation reconciliation
 
@@ -813,7 +836,12 @@ SDK core exposes two related provider-neutral capabilities:
    operation capability, a stable caller request key, and a typed target. It
    derives one Broker idempotency key and invokes the canonical Broker lifecycle
    operation. Results never expose endpoint URLs, tokens, process identities,
-   cleanup paths, or raw Broker receipts.
+   cleanup paths, or raw Broker receipts. Successful create, fork, and resume
+   results may include the credential-free `endpointGeneration` plus opaque
+   `endpointIncarnation`; pass both back for an exact close authority rather
+   than deriving a replacement identity from the numeric generation. A supplied
+   saved-session `sessionIdentity` is enforced as the transcript snapshot
+   precondition for resume and fork.
 2. **`SessionRouter`** owns live attachment discovery and transport. It validates
    the exact indexed endpoint generation, keeps credentials and `SdkClient`
    instances private, replays from the attachment cursor, reconnects after
@@ -877,12 +905,16 @@ End-to-end manual check once `gjc notify setup` has paired your private chat:
    <branch>`, or `/session_create dir <newdir>`. The SDK lifecycle service submits
    one canonical Broker create request; the bot reports the credential-free
    outcome.
-3. `/session_recent` lists verified recent managed sessions.
+3. `/session_recent` lists verified recent managed sessions, marks whether each
+   session is connected or only saved, and includes a resume command for saved
+   sessions.
 4. `/session_close <sessionId>` asks Broker lifecycle to close the exact managed
-   session and preserves history.
+   session and preserves history. Inside that session's Telegram topic, omit the
+   ID and use `/session_close`.
 5. `/session_resume <sessionId|prefix>` resolves verified managed history,
    reattaches a live session or performs canonical Broker resume, and refuses
-   ambiguous prefixes.
+   ambiguous prefixes. Inside an existing session topic, including an inactive
+   topic left by a stopped session, omit the ID and use `/session_resume`.
 
 Commands are accepted only from the paired chat. Duplicate Telegram updates and
 replayed topic reservations reuse their original request identity; they never

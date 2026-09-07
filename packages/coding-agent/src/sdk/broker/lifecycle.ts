@@ -69,7 +69,7 @@ import {
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
-import { matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
+import { endpointIncarnation, matchesIndexedEndpointFile, readEndpointFile } from "./endpoint-authority";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
@@ -812,6 +812,20 @@ function sameResumeSessionIdentity(left: ResumeScope, right: ResumeScope): boole
 		left.sessionIdentity.sha256 === right.sessionIdentity.sha256
 	);
 }
+function sameSavedTranscriptIdentity(
+	actual: { dev: bigint; ino: bigint; size: number; mtimeMs: number; mtimeNs: bigint; sha256: string },
+	expected: unknown,
+): boolean {
+	return (
+		isSessionLifecycleTranscriptIdentity(expected) &&
+		actual.dev.toString() === expected.dev &&
+		actual.ino.toString() === expected.ino &&
+		actual.size === expected.size &&
+		actual.mtimeMs === expected.mtimeMs &&
+		actual.mtimeNs.toString() === expected.mtimeNs &&
+		actual.sha256 === expected.sha256
+	);
+}
 function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRecord): boolean {
 	return (
 		current.live &&
@@ -890,6 +904,7 @@ async function validateSavedTranscript(
 	suppliedPath: string | undefined,
 	expectedSessionId: string | undefined,
 	label: "Saved" | "Source",
+	expectedIdentity?: unknown,
 ): Promise<ValidatedTranscript | BrokerResponse> {
 	const inventory = await managedCandidates(broker, cwd, label);
 	if ("ok" in inventory) return inventory;
@@ -902,6 +917,11 @@ async function validateSavedTranscript(
 	if (matches.length !== 1 || !isCanonicalSessionId(matches[0]!.sessionId))
 		return fail("invalid_input", `${label} saved session does not match the requested workspace and session id.`);
 	const match = matches[0]!;
+	if (expectedIdentity !== undefined && !sameSavedTranscriptIdentity(match.identity, expectedIdentity))
+		return fail(
+			"invalid_input",
+			`${label} saved session does not match the requested workspace, session id, and transcript identity.`,
+		);
 	if (inventory.migrationPolicy === "disabled" && match.provenance === "legacy")
 		return fail("legacy_migration_disabled", `${label} legacy session migration is disabled for this workspace.`);
 	return { path: match.path, id: match.sessionId, identity: serializeTranscriptIdentity(match.identity) };
@@ -959,6 +979,8 @@ async function validateLiveResumeScope(
 	if (matches.length !== 1)
 		return fail("endpoint_stale", "Requested saved session does not match the live session scope.");
 	const session = matches[0]!;
+	if (input.sessionIdentity !== undefined && !sameSavedTranscriptIdentity(session.identity, input.sessionIdentity))
+		return fail("invalid_input", "Saved session transcript identity does not match the requested snapshot.");
 	if (inventory.migrationPolicy === "disabled" && matches[0]!.provenance === "legacy")
 		return fail("legacy_migration_disabled", "Saved legacy session migration is disabled for this workspace.");
 	return {
@@ -1375,7 +1397,7 @@ export async function reapDeadLifecycleMarkers(
 	return reaped;
 }
 
-async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
+export async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
 	const directory = path.join(root, "sdk");
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	const temporary = path.join(directory, `.${id}.lifecycle.${randomUUID()}.tmp`);
@@ -2994,7 +3016,7 @@ async function reconcileLifecycleCleanup(
 	return completion;
 }
 
-async function readSessionLifecycleFailure(
+export async function readSessionLifecycleFailure(
 	root: string,
 	id: string,
 	expected: EffectMarker,
@@ -4392,7 +4414,7 @@ async function launchInput(
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
 		const savedPath = text(input.sessionPath);
 		if (!savedPath) return fail("invalid_input", "sessionPath is required to resume a saved session.");
-		const saved = await validateSavedTranscript(broker, cwd, savedPath, requested, "Saved");
+		const saved = await validateSavedTranscript(broker, cwd, savedPath, requested, "Saved", input.sessionIdentity);
 		if ("ok" in saved) return saved;
 		return {
 			id: requested,
@@ -4417,7 +4439,14 @@ async function launchInput(
 	const sourceSessionPath = text(input.sourceSessionPath) ?? text(input.sourcePath) ?? text(input.sessionPath);
 	if (!sourceSessionId && !sourceSessionPath)
 		return fail("invalid_input", "sourceSessionId or sourceSessionPath is required to fork a session.");
-	const source = await validateSavedTranscript(broker, sourceCwd, sourceSessionPath, sourceSessionId, "Source");
+	const source = await validateSavedTranscript(
+		broker,
+		sourceCwd,
+		sourceSessionPath,
+		sourceSessionId,
+		"Source",
+		input.sourceSessionIdentity,
+	);
 	if ("ok" in source) return source;
 	return {
 		id: randomUUID(),
@@ -4797,29 +4826,6 @@ type CloseRecord = {
 	processIncarnation?: string;
 };
 
-function endpointIncarnation(record: CloseRecord, sessionId: string): string | undefined {
-	if (
-		!Number.isSafeInteger(record.endpointGeneration) ||
-		record.endpointGeneration <= 0 ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.endpointMtimeMs !== "number" ||
-		!Number.isFinite(record.endpointMtimeMs) ||
-		record.endpointMtimeMs <= 0
-	)
-		return undefined;
-	return createHash("sha256")
-		.update(
-			JSON.stringify({
-				endpointGeneration: record.endpointGeneration,
-				endpointMtimeMs: record.endpointMtimeMs,
-				pid: record.pid,
-				sessionId,
-			}),
-		)
-		.digest("hex");
-}
-
 function requestedCloseAuthority(input: Input): { authority: CloseAuthority | undefined } | { error: BrokerResponse } {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;
@@ -4990,12 +4996,15 @@ async function executeLifecycleResponse(
 					return fail("endpoint_stale", "Live session changed while its resume authority was being verified.");
 				if (current.endpointMtimeMs === undefined)
 					return fail("endpoint_stale", "Live session endpoint authority is incomplete.");
+				const finalIncarnation = endpointIncarnation(current, requestedSessionId!);
+				if (!finalIncarnation) return fail("endpoint_stale", "Live session endpoint incarnation is unavailable.");
 				return {
 					ok: true,
 					result: {
 						sessionId: requestedSessionId,
 						cwd: finalScope.cwd,
 						endpointGeneration: current.endpointGeneration,
+						endpointIncarnation: finalIncarnation,
 						pid: current.pid,
 						endpointMtimeMs: current.endpointMtimeMs,
 						endpoint: endpoint.result,
@@ -5470,12 +5479,23 @@ async function executeLifecycleResponse(
 						"Session readiness authority changed and its spawned process could not be verified dead.",
 					);
 		}
+		if (!spawnedAuthority) return fail("endpoint_stale", "Session endpoint authority is unavailable.");
+		const replayIncarnation = endpointIncarnation(
+			{
+				endpointGeneration: verified.endpointGeneration,
+				endpointMtimeMs: verified.endpointMtimeMs,
+				pid: spawnedAuthority.pid,
+			},
+			launch.id,
+		);
+		if (!replayIncarnation) return fail("endpoint_stale", "Session endpoint incarnation is unavailable.");
 		return {
 			ok: true,
 			result: {
 				sessionId: launch.id,
 				cwd: launch.cwd,
 				endpointGeneration: verified.endpointGeneration,
+				endpointIncarnation: replayIncarnation,
 				pid: verified.endpoint.pid,
 				endpointMtimeMs: verified.endpointMtimeMs,
 				endpoint: verified.endpoint,

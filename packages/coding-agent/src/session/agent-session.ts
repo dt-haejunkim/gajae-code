@@ -4585,7 +4585,7 @@ export class AgentSession {
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		const configuredOnPayload = config.onPayload;
 		this.#onPayload = configuredOnPayload
-			? (payload, model, scope) => configuredOnPayload(payload, model, scope)
+			? (payload, model, scope, signal) => configuredOnPayload(payload, model, scope, signal)
 			: undefined;
 		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
 		// Avoid wrapping in an `async` closure when no user callback is configured: the
@@ -4594,9 +4594,9 @@ export class AgentSession {
 		// shows up as ~3.5% self time in streaming profiles.
 		const configuredOnResponse = config.onResponse;
 		this.#onResponse = configuredOnResponse
-			? async (response, model, scope) => {
+			? async (response, model, scope, signal) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
-					await configuredOnResponse(response, model, scope);
+					await configuredOnResponse(response, model, scope, signal);
 				}
 			: (response, model, _scope) => {
 					this.rawSseDebugBuffer.recordResponse(response, model);
@@ -6932,12 +6932,15 @@ export class AgentSession {
 					assistantMsg.stopReason !== "aborted" &&
 					this.#retryAttempt > 0
 				) {
+					// Clear ownership before notifying observers: agent_end may run while
+					// the success event is awaiting its subscribers.
+					const attempt = this.#retryAttempt;
+					this.#retryAttempt = 0;
 					await this.#emitSessionEvent({
 						type: "auto_retry_end",
 						success: true,
-						attempt: this.#retryAttempt,
+						attempt,
 					});
-					this.#retryAttempt = 0;
 					// Settle the retry gate here, colocated with the success event, rather
 					// than relying on the generic #resolveRetry() at the end of the
 					// agent_end branch. That tail resolver is bypassed by every early
@@ -10289,11 +10292,12 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
-		const wrapped = this.#wrapToolForCwdTransitionFence(
+		const innerTool = tool instanceof ExtensionToolWrapper ? tool.getInnerTool() : tool;
+		const guarded = this.#wrapToolForCwdTransitionFence(
 			this.#wrapToolForWorkflowMutationGuard(
 				this.#wrapToolForAcpPermission(
 					guardToolForUltragoalAsk(
-						tool,
+						innerTool,
 						() => this.sessionManager.getCwd(),
 						() => ({
 							activeSkillState: this.getActiveSkillState(),
@@ -10304,6 +10308,7 @@ export class AgentSession {
 				),
 			),
 		);
+		const wrapped = (this.#extensionRunner ? new ExtensionToolWrapper(guarded, this.#extensionRunner) : guarded) as T;
 		// The object published into `agent.state.tools` — and therefore the object the
 		// agent loop actually dispatches to — is this guard wrapper, not the registry
 		// entry. A wrapper built from a proven built-in inherits that proof; one built
@@ -10984,10 +10989,10 @@ export class AgentSession {
 				preparedOptions.onPayload = sessionOnPayload;
 			} else {
 				const requestOnPayload = options.onPayload;
-				preparedOptions.onPayload = async (payload, model, callbackScope) => {
-					const sessionPayload = await sessionOnPayload(payload, model, callbackScope);
+				preparedOptions.onPayload = async (payload, model, callbackScope, signal) => {
+					const sessionPayload = await sessionOnPayload(payload, model, callbackScope, signal);
 					const sessionResolvedPayload = sessionPayload ?? payload;
-					const requestPayload = await requestOnPayload(sessionResolvedPayload, model, callbackScope);
+					const requestPayload = await requestOnPayload(sessionResolvedPayload, model, callbackScope, signal);
 					return requestPayload ?? sessionResolvedPayload;
 				};
 			}
@@ -10998,9 +11003,9 @@ export class AgentSession {
 				preparedOptions.onResponse = sessionOnResponse;
 			} else {
 				const requestOnResponse = options.onResponse;
-				preparedOptions.onResponse = async (response, model, callbackScope) => {
-					await sessionOnResponse(response, model, callbackScope);
-					await requestOnResponse(response, model, callbackScope);
+				preparedOptions.onResponse = async (response, model, callbackScope, signal) => {
+					await sessionOnResponse(response, model, callbackScope, signal);
+					await requestOnResponse(response, model, callbackScope, signal);
 				};
 			}
 		}
@@ -11881,6 +11886,11 @@ export class AgentSession {
 		const releaseStartupPromptWaiter = this.#reserveStartupPromptWaiter();
 		try {
 			await this.#promptInternal(text, options, releaseStartupPromptWaiter);
+			// Agent-core converts listener failures into an aborted response. Keep a
+			// rejected persistence fence typed at the public prompt boundary instead
+			// of reporting the misleading provider-level "Request was aborted".
+			const appendRejection = this.sessionManager.getAppendIdentityMismatch();
+			if (appendRejection) throw appendRejection;
 		} finally {
 			releaseStartupPromptWaiter();
 		}
@@ -12472,6 +12482,14 @@ export class AgentSession {
 			hasPendingNextTurnMessages = pendingNextTurnMessageCount > 0;
 			const promptAttribution: "user" | "agent" | undefined =
 				"attribution" in message ? message.attribution : undefined;
+			let effectivePrompt = expandedText;
+			const messageImages =
+				"content" in message && Array.isArray(message.content)
+					? message.content.filter((content): content is ImageContent => content.type === "image")
+					: undefined;
+			let effectiveImages =
+				options?.images ?? (messageImages && messageImages.length > 0 ? messageImages : undefined);
+			let promptMessage = message;
 			let phaseACompleted = false;
 			let fileMentionMessages: AgentMessage[] = [];
 			let beforeAgentStartResultMessages: BeforeAgentStartInternalMessage[] = [];
@@ -12492,7 +12510,49 @@ export class AgentSession {
 				if (!phaseACompleted) {
 					phaseACompleted = true;
 					// Phase A (one-time side-effectful products; runs once).
-					const fileMentions = extractFileMentions(expandedText);
+					const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(effectivePrompt);
+					hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
+					planReferenceMessage = await this.#buildPlanReferenceMessage();
+					// Emit before_agent_start extension event. Race hook completion with
+					// prompt cancellation so a wedged hook cannot retain SDK prompt authority.
+					if (this.#extensionRunner?.hasHandlers("before_agent_start")) this.#markRetryReplayUnsafe();
+					if (this.#extensionRunner) {
+						const result = await this.#awaitPromptPreflight(
+							generation,
+							preflightSignal,
+							this.#extensionRunner.emitBeforeAgentStart(
+								effectivePrompt,
+								effectiveImages,
+								beforeAgentStartSystemPrompt,
+								preflightSignal,
+							),
+						);
+						if (result?.messages) beforeAgentStartResultMessages = [...result.messages];
+						if (result?.prompt !== undefined) effectivePrompt = result.prompt;
+						if (result && Object.hasOwn(result, "images")) effectiveImages = result.images;
+						if (result?.prompt !== undefined || (result && Object.hasOwn(result, "images"))) {
+							if (
+								promptMessage.role === "user" ||
+								promptMessage.role === "developer" ||
+								promptMessage.role === "custom"
+							) {
+								promptMessage = {
+									...promptMessage,
+									content: [{ type: "text", text: effectivePrompt }, ...(effectiveImages ?? [])],
+								};
+							}
+						}
+						if (result?.systemPrompt !== undefined) {
+							this.agent.setSystemPrompt(result.systemPrompt);
+						} else if (result?.prompt !== undefined) {
+							this.agent.setSystemPrompt(await this.#buildSystemPromptForAgentStart(effectivePrompt));
+						} else {
+							this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+						}
+					} else {
+						this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
+					}
+					const fileMentions = extractFileMentions(effectivePrompt);
 					if (fileMentions.length > 0) {
 						const cwd = this.sessionManager.getCwd();
 						// Collect resolved paths already shown (read or mentioned) in the
@@ -12520,31 +12580,6 @@ export class AgentSession {
 							recentlyShownPaths,
 						});
 					}
-					const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
-					hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
-					planReferenceMessage = await this.#buildPlanReferenceMessage();
-					// Emit before_agent_start extension event. Race hook completion with
-					// prompt cancellation so a wedged hook cannot retain SDK prompt authority.
-					if (this.#extensionRunner?.hasHandlers("before_agent_start")) this.#markRetryReplayUnsafe();
-					if (this.#extensionRunner) {
-						const result = await this.#awaitPromptPreflight(
-							generation,
-							preflightSignal,
-							this.#extensionRunner.emitBeforeAgentStart(
-								expandedText,
-								options?.images,
-								beforeAgentStartSystemPrompt,
-							),
-						);
-						if (result?.messages) beforeAgentStartResultMessages = [...result.messages];
-						if (result?.systemPrompt !== undefined) {
-							this.agent.setSystemPrompt(result.systemPrompt);
-						} else {
-							this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
-						}
-					} else {
-						this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
-					}
 					// Invoke first-party internal before-agent-start contributors. These
 					// run alongside the extension runner (not via user-loaded hooks) and
 					// append through the same custom-message attribution path. Errors are nonfatal.
@@ -12555,8 +12590,8 @@ export class AgentSession {
 									generation,
 									preflightSignal,
 									contributor({
-										prompt: expandedText,
-										images: options?.images,
+										prompt: effectivePrompt,
+										images: effectiveImages,
 										sessionId: this.sessionId,
 									}),
 								);
@@ -12614,7 +12649,7 @@ export class AgentSession {
 				}
 
 				const promptIndex = messages.length;
-				messages.push(message);
+				messages.push(promptMessage);
 
 				// Re-present captured pending next-turn messages (never drained here).
 				// Reclassify deferred envelopes before injecting them into the new
@@ -19449,10 +19484,10 @@ export class AgentSession {
 					isError: message.isError,
 					content: this.#normalizeProviderReplayValue(message.content),
 				};
-			case "bashExecution":
+			case "pythonExecution":
 				return {
 					role: message.role,
-					command: message.command,
+					code: message.code,
 					output: message.output,
 					exitCode: message.exitCode,
 					cancelled: message.cancelled,
@@ -19470,12 +19505,13 @@ export class AgentSession {
 						: undefined,
 					excludeFromContext: message.excludeFromContext,
 				};
-			case "pythonExecution":
+			case "bashExecution":
 				return {
 					role: message.role,
-					code: message.code,
+					command: message.command,
 					output: message.output,
 					exitCode: message.exitCode,
+					signal: message.signal,
 					cancelled: message.cancelled,
 					meta: message.meta
 						? {
@@ -22352,6 +22388,7 @@ export class AgentSession {
 			command,
 			output: result.output,
 			exitCode: result.exitCode,
+			signal: result.signal,
 			cancelled: result.cancelled,
 			truncated: result.truncated,
 			meta,

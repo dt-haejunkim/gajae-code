@@ -277,6 +277,50 @@ mod platform {
 		}
 	}
 
+	pub fn processes_in_group(pgid: i32) -> Option<Vec<Process>> {
+		let entries = fs::read_dir("/proc").ok()?;
+		let mut processes = Vec::new();
+		for entry in entries {
+			let entry = entry.ok()?;
+			let Some(pid) = entry
+				.file_name()
+				.to_str()
+				.and_then(|name| name.parse::<i32>().ok())
+			else {
+				continue;
+			};
+			if let Some(process) = Process::from_pid(pid)
+				&& process.group_id() == Some(pgid)
+			{
+				processes.push(process);
+			}
+		}
+		Some(processes)
+	}
+
+	pub fn processes_in_session(sid: i32) -> Option<Vec<Process>> {
+		let entries = fs::read_dir("/proc").ok()?;
+		let mut processes = Vec::new();
+		for entry in entries {
+			let entry = entry.ok()?;
+			let Some(pid) = entry
+				.file_name()
+				.to_str()
+				.and_then(|name| name.parse::<i32>().ok())
+			else {
+				continue;
+			};
+			let Some(process) = Process::from_pid(pid) else {
+				continue;
+			};
+			// SAFETY: `pid` names the identity-validated live process above.
+			if unsafe { libc::getsid(pid) } == sid {
+				processes.push(process);
+			}
+		}
+		Some(processes)
+	}
+
 	fn split_nul_arguments(content: &[u8]) -> Vec<String> {
 		content
 			.split(|byte| *byte == 0)
@@ -401,7 +445,24 @@ mod platform {
 	#[link(name = "proc", kind = "dylib")]
 	unsafe extern "C" {
 		fn proc_listallpids(buffer: *mut i32, buffersize: i32) -> i32;
+		fn proc_pidinfo(
+			pid: i32,
+			flavor: i32,
+			arg: u64,
+			buffer: *mut std::ffi::c_void,
+			buffersize: i32,
+		) -> i32;
 		fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, buffersize: u32) -> i32;
+	}
+
+	#[repr(C)]
+	struct ProcUniqueIdentifierInfo {
+		_uuid:              [u8; 16],
+		unique_id:          u64,
+		_parent_unique_id:  u64,
+		_id_version:        i32,
+		_original_ppid_ver: i32,
+		_reserved:          [u64; 2],
 	}
 
 	/// macOS does not expose pidfds; identity is pinned via the kernel-reported
@@ -420,10 +481,7 @@ mod platform {
 				return None;
 			}
 			let info = read_bsdinfo(pid)?;
-			if i32::try_from(info.pbi_pid).ok()? != pid {
-				return None;
-			}
-			Some(Self { pid, start_tvsec: info.pbi_start_tvsec, start_tvusec: info.pbi_start_tvusec })
+			Some(Self { pid, start_tvsec: info.start_tvsec, start_tvusec: info.start_tvusec })
 		}
 
 		pub const fn pid(&self) -> i32 {
@@ -433,6 +491,22 @@ mod platform {
 		/// Kernel-derived identity evidence for this exact process incarnation.
 		pub fn incarnation(&self) -> String {
 			format!("darwin:{}:{}", self.start_tvsec, self.start_tvusec)
+		}
+
+		pub fn unique_id(&self) -> Option<u64> {
+			self.live_bsdinfo()?;
+			let mut info = std::mem::MaybeUninit::<ProcUniqueIdentifierInfo>::zeroed();
+			let size = i32::try_from(std::mem::size_of::<ProcUniqueIdentifierInfo>()).ok()?;
+			// SAFETY: `info` is a writable buffer of the exact flavor-17 structure
+			// size and libproc initializes it completely on a full-size result.
+			let read = unsafe { proc_pidinfo(self.pid, 17, 0, info.as_mut_ptr().cast(), size) };
+			if read != size {
+				return None;
+			}
+			// SAFETY: the full structure size was reported initialized above.
+			let unique_id = unsafe { info.assume_init() }.unique_id;
+			self.live_bsdinfo()?;
+			Some(unique_id)
 		}
 
 		pub fn children(&self) -> Vec<Self> {
@@ -456,7 +530,7 @@ mod platform {
 
 		pub fn parent_pid(&self) -> Option<i32> {
 			let info = self.live_bsdinfo()?;
-			i32::try_from(info.pbi_ppid).ok().filter(|ppid| *ppid > 0)
+			(info.ppid > 0).then_some(info.ppid)
 		}
 
 		pub fn args(&self) -> Vec<String> {
@@ -482,7 +556,7 @@ mod platform {
 
 		pub fn group_id(&self) -> Option<i32> {
 			let info = self.live_bsdinfo()?;
-			i32::try_from(info.pbi_pgid).ok().filter(|pgid| *pgid > 0)
+			(info.pgid > 0).then_some(info.pgid)
 		}
 
 		/// Walk the descendant tree in post-order (leaves first), de-duplicating
@@ -548,12 +622,12 @@ mod platform {
 			}
 		}
 
-		/// Returns the current `proc_bsdinfo` only if it still describes the same
+		/// Returns the current process record only if it still describes the same
 		/// process this reference was opened on — i.e. the start time has not
 		/// changed.
-		fn live_bsdinfo(&self) -> Option<libc::proc_bsdinfo> {
+		fn live_bsdinfo(&self) -> Option<ProcInfo> {
 			let info = read_bsdinfo(self.pid)?;
-			if info.pbi_start_tvsec == self.start_tvsec && info.pbi_start_tvusec == self.start_tvusec {
+			if info.start_tvsec == self.start_tvsec && info.start_tvusec == self.start_tvusec {
 				Some(info)
 			} else {
 				None
@@ -575,11 +649,11 @@ mod platform {
 
 	/// Snapshot every pid currently visible to `proc_listallpids`. macOS
 	/// silently truncates the second call to the supplied buffer size even
-	/// when the sizing query reports more bytes available, so the buffer is
+	/// when the sizing query reports more PIDs available, so the buffer is
 	/// padded well beyond the reported count.
 	fn snapshot_all_pids() -> Option<Vec<i32>> {
 		// SAFETY: Passing a null buffer with size 0 is the documented libproc query
-		// form for obtaining the byte count needed for all PIDs; libproc does not
+		// form for obtaining the PID count needed for all PIDs; libproc does not
 		// dereference the null pointer in this mode.
 		let bytes = unsafe { proc_listallpids(ptr::null_mut(), 0) };
 		if bytes <= 0 {
@@ -588,7 +662,7 @@ mod platform {
 			// look" as "nothing to kill" and leave live children behind.
 			return None;
 		}
-		let count = (bytes as usize) / size_of::<i32>();
+		let count = bytes as usize;
 		let cap = count.saturating_mul(4).max(2048);
 		let mut buffer = vec![0i32; cap];
 		// SAFETY: `buffer` is valid for `buffer.len() * size_of::<i32>()` bytes and
@@ -598,9 +672,29 @@ mod platform {
 		if actual <= 0 {
 			return None;
 		}
-		let pid_count = ((actual as usize) / size_of::<i32>()).min(buffer.len());
+		let pid_count = (actual as usize).min(buffer.len());
 		buffer.truncate(pid_count);
 		Some(buffer)
+	}
+
+	pub fn processes_in_group(pgid: i32) -> Option<Vec<Process>> {
+		Some(
+			snapshot_all_pids()?
+				.into_iter()
+				.filter_map(Process::from_pid)
+				.filter(|process| process.group_id() == Some(pgid))
+				.collect(),
+		)
+	}
+
+	pub fn processes_in_session(sid: i32) -> Option<Vec<Process>> {
+		Some(
+			snapshot_all_pids()?
+				.into_iter()
+				.filter_map(Process::from_pid)
+				.filter(|process| unsafe { libc::getsid(process.pid()) } == sid)
+				.collect(),
+		)
 	}
 
 	/// Build a `ppid -> [pids]` map from a one-shot scan of `proc_listallpids`.
@@ -619,9 +713,7 @@ mod platform {
 				// race, not an observation failure: skip it and keep the snapshot.
 				continue;
 			};
-			let Ok(ppid) = i32::try_from(info.pbi_ppid) else {
-				continue;
-			};
+			let ppid = info.ppid;
 			if ppid <= 0 {
 				continue;
 			}
@@ -669,24 +761,72 @@ mod platform {
 		matches
 	}
 
-	fn read_bsdinfo(pid: i32) -> Option<libc::proc_bsdinfo> {
-		// SAFETY: `proc_bsdinfo` is a plain C data struct. Zero initialization is
-		// valid because every field is an integer or fixed-size integer array, and
-		// libproc fully overwrites the fields it reports on a successful call.
-		let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
-		// SAFETY: `info` is a writable `proc_bsdinfo` buffer whose exact byte size is
-		// supplied to libproc. The PID, flavor, and arg are scalar values passed by
-		// value; libproc writes at most the supplied buffer size.
-		let actual = unsafe {
-			libc::proc_pidinfo(
-				pid,
-				libc::PROC_PIDTBSDINFO,
+	/// The subset of `kinfo_proc` this module needs, read through
+	/// `sysctl(KERN_PROC_PID)`.
+	///
+	/// `proc_pidinfo(PROC_PIDTBSDINFO)` is deliberately not used: the kernel
+	/// refuses it with `EPERM` for setuid or entitlement-carrying children such
+	/// as `/bin/ps`, `/usr/bin/top`, and `sudo`, so a shell that spawned one of
+	/// them could never open a stable reference to its own child.
+	/// `KERN_PROC_PID` reports the same identity fields for every process
+	/// visible to the caller.
+	#[derive(Clone, Copy)]
+	struct ProcInfo {
+		pid:          i32,
+		ppid:         i32,
+		pgid:         i32,
+		start_tvsec:  u64,
+		start_tvusec: u64,
+	}
+
+	/// `sizeof(struct kinfo_proc)` and the field offsets used below, from
+	/// `<sys/sysctl.h>` on 64-bit Darwin (identical on `arm64` and `x86_64`):
+	/// `kp_proc.p_un.__p_starttime` is the leading `struct timeval`
+	/// (`tv_sec: i64` at 0, `tv_usec: i32` at 8), `kp_proc.p_pid` follows
+	/// `p_flag`/`p_stat` at 40, and `kp_eproc.e_ppid`/`e_pgid` sit after the
+	/// embedded credential and vmspace blocks at 560/564.
+	const KINFO_PROC_SIZE: usize = 648;
+	const KINFO_PROC_START_TVSEC: usize = 0;
+	const KINFO_PROC_START_TVUSEC: usize = 8;
+	const KINFO_PROC_PID: usize = 40;
+	const KINFO_PROC_PPID: usize = 560;
+	const KINFO_PROC_PGID: usize = 564;
+
+	fn read_bsdinfo(pid: i32) -> Option<ProcInfo> {
+		let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+		let mut buffer = [0u8; KINFO_PROC_SIZE];
+		let mut len = buffer.len();
+		// SAFETY: `mib` points to four initialized integers, `buffer` is a
+		// writable region of exactly `len` bytes, and `len` is a valid in/out
+		// length parameter; the kernel writes at most `len` bytes.
+		let rc = unsafe {
+			libc::sysctl(
+				mib.as_mut_ptr(),
+				mib.len() as u32,
+				buffer.as_mut_ptr().cast::<std::ffi::c_void>(),
+				&raw mut len,
+				ptr::null_mut(),
 				0,
-				(&raw mut info).cast::<std::ffi::c_void>(),
-				size_of::<libc::proc_bsdinfo>() as i32,
 			)
 		};
-		if actual < size_of::<libc::proc_bsdinfo>() as i32 {
+		// A pid that does not exist returns success with zero bytes written.
+		if rc != 0 || len != KINFO_PROC_SIZE {
+			return None;
+		}
+		let read_i32 = |offset: usize| {
+			i32::from_ne_bytes(buffer[offset..offset + 4].try_into().expect("4-byte slice"))
+		};
+		let read_i64 = |offset: usize| {
+			i64::from_ne_bytes(buffer[offset..offset + 8].try_into().expect("8-byte slice"))
+		};
+		let info = ProcInfo {
+			pid:          read_i32(KINFO_PROC_PID),
+			ppid:         read_i32(KINFO_PROC_PPID),
+			pgid:         read_i32(KINFO_PROC_PGID),
+			start_tvsec:  u64::try_from(read_i64(KINFO_PROC_START_TVSEC)).ok()?,
+			start_tvusec: u64::try_from(read_i32(KINFO_PROC_START_TVUSEC)).ok()?,
+		};
+		if info.pid != pid {
 			return None;
 		}
 		Some(info)
@@ -1091,6 +1231,14 @@ mod platform {
 		}
 	}
 
+	pub fn processes_in_group(_pgid: i32) -> Option<Vec<Process>> {
+		Some(Vec::new())
+	}
+
+	pub fn processes_in_session(_sid: i32) -> Option<Vec<Process>> {
+		Some(Vec::new())
+	}
+
 	fn process_basic_information(handle: Handle) -> Option<ProcessBasicInformation> {
 		let mut info = ProcessBasicInformation {
 			exit_status: 0,
@@ -1415,6 +1563,25 @@ impl Process {
 		self.inner.incarnation()
 	}
 
+	/// Darwin's kernel-stable unique process identifier, when available.
+	#[cfg_attr(
+		not(target_os = "macos"),
+		allow(
+			clippy::missing_const_for_fn,
+			reason = "macOS performs a live libproc identity lookup"
+		)
+	)]
+	pub fn darwin_unique_id(&self) -> Option<u64> {
+		#[cfg(target_os = "macos")]
+		{
+			self.inner.unique_id()
+		}
+		#[cfg(not(target_os = "macos"))]
+		{
+			None
+		}
+	}
+
 	/// Parent process id for this process, when available.
 	pub fn ppid(&self) -> Option<i32> {
 		self.inner.parent_pid()
@@ -1561,6 +1728,21 @@ impl Process {
 		signaled
 	}
 
+	fn signal_tree_without_group(&self, signal: i32) -> u32 {
+		let descendants = self.live_descendants();
+		let current_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+		let mut signaled = 0u32;
+		for child in &descendants {
+			if child.pid() != current_pid && child.inner.kill(signal) {
+				signaled += 1;
+			}
+		}
+		if self.pid() != current_pid && self.inner.kill(signal) {
+			signaled += 1;
+		}
+		signaled
+	}
+
 	async fn terminate_tree_impl(
 		&self,
 		group: bool,
@@ -1677,6 +1859,10 @@ fn is_self_process_group(pgid: i32) -> bool {
 	self_pgid > 0 && self_pgid == pgid
 }
 
+pub fn is_current_process_group(pgid: i32) -> bool {
+	is_self_process_group(pgid)
+}
+
 #[cfg(not(unix))]
 const fn is_self_process_group(_pgid: i32) -> bool {
 	false
@@ -1684,6 +1870,12 @@ const fn is_self_process_group(_pgid: i32) -> bool {
 
 /// POSIX `SIGTERM` / Windows polite termination sentinel.
 pub const TERM_SIGNAL: i32 = 15;
+
+/// POSIX uncatchable stop used to freeze an externally-owned command group.
+#[cfg(unix)]
+pub const STOP_SIGNAL: i32 = libc::SIGSTOP;
+#[cfg(not(unix))]
+pub const STOP_SIGNAL: i32 = 0;
 
 /// POSIX `SIGKILL` / Windows hard-termination sentinel.
 pub const KILL_SIGNAL: i32 = 9;
@@ -1703,6 +1895,8 @@ pub struct TerminationTargets {
 }
 
 impl TerminationTargets {
+	const MAX_STABLE_PROCESSES: usize = 4096;
+
 	/// Create an empty target set.
 	pub fn new() -> Self {
 		Self::default()
@@ -1719,9 +1913,18 @@ impl TerminationTargets {
 	/// a stable [`Process`] reference so the descendant tree can be
 	/// killed even if the original pid is reused later.
 	pub fn add_pid(&mut self, pid: i32) {
-		if self.seen_pids.insert(pid)
+		if self.processes.len() < Self::MAX_STABLE_PROCESSES
+			&& self.seen_pids.insert(pid)
 			&& let Some(process) = Process::from_pid(pid)
 		{
+			self.processes.push(process);
+		}
+	}
+
+	/// Record an already observed stable process authority without reopening its
+	/// PID.
+	pub fn add_process(&mut self, process: Process) {
+		if self.processes.len() < Self::MAX_STABLE_PROCESSES && self.seen_pids.insert(process.pid()) {
 			self.processes.push(process);
 		}
 	}
@@ -1736,6 +1939,56 @@ impl TerminationTargets {
 		self.pgids.first().copied()
 	}
 
+	/// Return a live process group proven by an incarnation-bound member.
+	pub fn first_owned_process_group(&self) -> Option<i32> {
+		self
+			.processes
+			.iter()
+			.filter(|process| process.status() == ProcessStatus::Running)
+			.filter_map(Process::group_id)
+			.find(|&pgid| pgid > 0 && !is_current_process_group(pgid))
+	}
+
+	/// Whether an incarnation-bound process authority was captured for `pid`.
+	pub fn owns_pid(&self, pid: i32) -> bool {
+		self.processes.iter().any(|process| {
+			process.pid() == pid
+				&& process.status() == ProcessStatus::Running
+				&& process.group_id() == Some(pid)
+		})
+	}
+
+	/// Whether a live incarnation-bound member pins this process-group identity.
+	pub fn owns_process_group(&self, pgid: i32) -> bool {
+		pgid > 0
+			&& !is_current_process_group(pgid)
+			&& self.processes.iter().any(|process| {
+				process.status() == ProcessStatus::Running && process.group_id() == Some(pgid)
+			})
+	}
+
+	/// Whether a captured group leader still proves the numeric group identity.
+	/// A live replacement at the leader PID invalidates the authority; when no
+	/// process currently owns that PID, any surviving group members still belong
+	/// to the captured leader because a new group cannot be created without it.
+	pub fn owns_process_group_identity(&self, pgid: i32) -> bool {
+		if pgid <= 0 || is_current_process_group(pgid) {
+			return false;
+		}
+		let Some(recorded) = self.processes.iter().find(|process| process.pid() == pgid) else {
+			return false;
+		};
+		Process::from_pid(pgid).is_none_or(|current| current.incarnation() == recorded.incarnation())
+	}
+
+	/// Drop numeric process-group targets while retaining stable process
+	/// authorities. Use this after the polite wave: a vacated PGID can be reused
+	/// before escalation, while retained process handles remain
+	/// incarnation-bound.
+	pub fn clear_pgids(&mut self) {
+		self.pgids.clear();
+	}
+
 	/// Send `signal` to every recorded target. Failures are swallowed:
 	/// targets routinely exit between collection and signalling, and
 	/// the caller's policy is "best effort".
@@ -1747,6 +2000,69 @@ impl TerminationTargets {
 			let _ = process.signal_tree(signal);
 		}
 	}
+
+	/// Signal only incarnation-bound process trees, never numeric process
+	/// groups.
+	pub fn signal_processes(&self, signal: i32) {
+		for process in &self.processes {
+			let _ = process.signal_tree_without_group(signal);
+		}
+	}
+
+	/// Retain currently visible descendants of already owned process roots.
+	pub fn retain_owned_descendants(&mut self) {
+		let descendants: Vec<Process> = self
+			.processes
+			.iter()
+			.flat_map(Process::live_descendants)
+			.collect();
+		for process in descendants {
+			self.add_process(process);
+		}
+	}
+}
+
+/// Pin every currently visible member of an owned process group.
+/// Returns false when the process table could not be observed.
+pub fn add_process_group_members(targets: &mut TerminationTargets, pgid: i32) -> bool {
+	let Some(processes) = platform::processes_in_group(pgid) else {
+		return false;
+	};
+	for process in processes {
+		targets.add_process(Process::from_inner(process));
+	}
+	true
+}
+
+#[cfg(unix)]
+pub fn add_new_session_members<S: std::hash::BuildHasher>(
+	targets: &mut TerminationTargets,
+	baseline: &HashSet<i32, S>,
+) -> bool {
+	let self_pid = i32::try_from(std::process::id()).unwrap_or_default();
+	let parent_pid = Process::from_pid(self_pid).and_then(|process| process.ppid());
+	// SAFETY: getsid(0) queries the current process and touches no caller memory.
+	let sid = unsafe { libc::getsid(0) };
+	let Some(processes) = platform::processes_in_session(sid) else {
+		return false;
+	};
+	for process in processes {
+		if process.pid() != self_pid
+			&& Some(process.pid()) != parent_pid
+			&& !baseline.contains(&process.pid())
+		{
+			targets.add_process(Process::from_inner(process));
+		}
+	}
+	true
+}
+
+#[cfg(not(unix))]
+pub fn add_new_session_members<S: std::hash::BuildHasher>(
+	_targets: &mut TerminationTargets,
+	_baseline: &HashSet<i32, S>,
+) -> bool {
+	false
 }
 
 #[must_use]
@@ -1795,7 +2111,10 @@ impl DescendantBaseline {
 	pub fn capture() -> Self {
 		const ATTEMPTS: u32 = 3;
 		for attempt in 0..ATTEMPTS {
-			if let Some(pids) = current_descendant_pids_observed() {
+			if let (Some(mut pids), Some(session_pids)) =
+				(current_descendant_pids_observed(), current_session_pids_observed())
+			{
+				pids.extend(session_pids);
 				return Self { pids, observed: true };
 			}
 			if attempt + 1 < ATTEMPTS {
@@ -1813,6 +2132,24 @@ impl DescendantBaseline {
 	#[must_use]
 	pub const fn pids(&self) -> &HashSet<i32> {
 		&self.pids
+	}
+}
+
+fn current_session_pids_observed() -> Option<HashSet<i32>> {
+	#[cfg(unix)]
+	{
+		// SAFETY: getsid(0) queries the calling process's session.
+		let sid = unsafe { libc::getsid(0) };
+		Some(
+			platform::processes_in_session(sid)?
+				.into_iter()
+				.map(|process| process.pid())
+				.collect(),
+		)
+	}
+	#[cfg(not(unix))]
+	{
+		Some(HashSet::new())
 	}
 }
 
@@ -2012,6 +2349,15 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn termination_targets_refuse_current_process() {
+		let current_pid = i32::try_from(std::process::id()).expect("current pid should fit i32");
+		let mut targets = TerminationTargets::new();
+		targets.add_pid(current_pid);
+		targets.signal_processes(KILL_SIGNAL);
+		assert!(Process::from_pid(current_pid).is_some());
+	}
+
 	/// Regression test for the macOS `proc_listchildpids` brokenness: on
 	/// darwin 25.4+ the kernel returns no entries when a process queries its
 	/// own children via that API, so `Process::descendants` produced an empty
@@ -2076,5 +2422,40 @@ mod tests {
 		assert!(child.try_wait().expect("poll child").is_none());
 		child.kill().expect("cleanup child");
 		let _ = child.wait();
+	}
+
+	/// Regression test for entitlement-restricted children on macOS. `/bin/ps`
+	/// and `/usr/bin/top` carry private entitlements, so
+	/// `proc_pidinfo(PROC_PIDTBSDINFO)` on them fails with `EPERM` even for
+	/// their own parent. The ownership ledger treats "cannot open a stable
+	/// reference to a child we just spawned" as a fatal integrity failure
+	/// (`exit(70)`), which turned every `ps`, `top`, or `sudo` invocation in
+	/// the bash tool into a dead shell runtime. `top -l 0` samples forever, so
+	/// the child is guaranteed alive while it is inspected.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn from_pid_opens_entitled_child() {
+		use std::process::{Command, Stdio};
+
+		let mut child = Command::new("/usr/bin/top")
+			.args(["-l", "0", "-s", "1", "-n", "0"])
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.spawn()
+			.expect("spawn top");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let self_pid = i32::try_from(std::process::id()).expect("self pid fits in i32");
+		let process = Process::from_pid(pid);
+		let ppid = process.as_ref().and_then(Process::ppid);
+		let pgid = process
+			.as_ref()
+			.and_then(|process| process.inner.group_id());
+		let _ = child.kill();
+		let _ = child.wait();
+		let process = process.expect("stable reference to an entitlement-restricted child");
+		assert_eq!(process.pid(), pid);
+		assert!(process.incarnation().starts_with("darwin:"));
+		assert_eq!(ppid, Some(self_pid));
+		assert!(pgid.is_some_and(|pgid| pgid > 0));
 	}
 }

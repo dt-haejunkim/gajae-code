@@ -16,8 +16,10 @@ import {
 import { AcpAgent, acpRequestFailure } from "@gajae-code/coding-agent/modes/acp/acp-agent";
 import { createAcpConnection } from "@gajae-code/coding-agent/modes/acp/acp-mode";
 import { TempDir } from "@gajae-code/utils";
+import packageJson from "../../package.json" with { type: "json" };
 import { AcpSdkAdapterError } from "../../src/sdk/acp";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { DEFAULT_READINESS_TIMEOUT_MS, MAX_READINESS_TIMEOUT_MS } from "../../src/sdk/broker/startup-budget";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -75,6 +77,7 @@ describe("ACP production cancellation completion", () => {
 		let promptSocket: TestSocket | undefined;
 		let promptCount = 0;
 		let abortAcknowledged = true;
+		let createInput: Record<string, unknown> | undefined;
 
 		server = Bun.serve({
 			hostname: "127.0.0.1",
@@ -98,6 +101,7 @@ describe("ACP production cancellation completion", () => {
 					}
 					if (frame.type === "broker_request") {
 						if (frame.operation === "session.create") {
+							createInput = frame.input as Record<string, unknown>;
 							socket.send(
 								JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }),
 							);
@@ -189,7 +193,7 @@ describe("ACP production cancellation completion", () => {
 		await writeBrokerDiscovery(agentDir, {
 			version: 1,
 			protocolVersion: 3,
-			packageGeneration: "test",
+			packageGeneration: packageJson.version,
 			ownerId: "test-owner",
 			pid: process.pid,
 			host: "127.0.0.1",
@@ -209,6 +213,14 @@ describe("ACP production cancellation completion", () => {
 		} as unknown as AgentSideConnection;
 		const acp = new AcpAgent(connection, { agentDir });
 		const created = await bounded(acp.newSession({ cwd, mcpServers: [] }), "new session");
+		// A launch that declares no MCP servers still pays the host's cold start, so it must
+		// ask for more than the broker's bare default; leaving it there made an MCP-less ACP
+		// client the only caller whose `session/new` died on a concurrent host start.
+		const requestedReadiness = createInput?.readinessTimeoutMs;
+		expect(typeof requestedReadiness).toBe("number");
+		expect(requestedReadiness as number).toBeGreaterThan(DEFAULT_READINESS_TIMEOUT_MS);
+		expect(requestedReadiness as number).toBeLessThanOrEqual(MAX_READINESS_TIMEOUT_MS);
+		expect(createInput).not.toHaveProperty("mcpServers");
 		expect(created.configOptions).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({

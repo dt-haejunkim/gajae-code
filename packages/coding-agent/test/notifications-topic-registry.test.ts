@@ -372,6 +372,31 @@ describe("TopicRegistry", () => {
 		await expect(reg.getOrCreateTopic("s1", async () => "2")).rejects.toThrow("topic authority is archive-fenced");
 		expect(reg.get("s1")?.topicId).toBe("1");
 	});
+
+	test("resolves inactive topics only for explicit same-chat lifecycle controls", async () => {
+		const reg = new TopicRegistry({
+			version: 2,
+			registryGeneration: 1,
+			topics: {
+				s1: {
+					topicId: "1",
+					topicOrigin: "daemon_created",
+					sessionUuid: "00000000-0000-4000-8000-000000000001",
+					identitySent: true,
+					createdAt: 1,
+					authorityEpoch: 1,
+					authorityState: "inactive",
+					chatId: "42",
+					telegramBinding: { chatId: "42", transport: "telegram" },
+				},
+			},
+		});
+
+		expect(reg.sessionForTopic("1")).toBeUndefined();
+		expect(reg.sessionForLifecycleTopic("1", "42")).toBe("s1");
+		expect(reg.sessionForLifecycleTopic("1", "other-chat")).toBeUndefined();
+	});
+
 	test("clears disconnect grace before persisting an archive fence", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");
@@ -756,7 +781,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 181 at serving epoch 88", () => {
+test("publishes exact durable authority generation 182 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -802,7 +827,7 @@ test("publishes exact durable authority generation 181 at serving epoch 88", () 
 	// notification publications instead of cancelling the subscription on the
 	// first refusal, so generation-178 owners that kill a session's mirroring
 	// after one transient rejection are replaced across this upgrade.
-	expect(DAEMON_GENERATION).toBe(181);
+	expect(DAEMON_GENERATION).toBe(182);
 	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {
